@@ -1305,6 +1305,7 @@ void I2sDma::flip_buffer() {
 }
 
 void I2sDma::flush_cache_to_dma() {
+#if HUB75_EXTERNAL_FRAMEBUFFERS == 1
   // Only flush for PSRAM (external RAM) - internal SRAM doesn't need cache sync
   // This handles ESP32-C6 automatically: C6 uses internal RAM, so esp_ptr_external_ram()
   // returns false and we skip the msync (which would be unnecessary overhead).
@@ -1319,6 +1320,7 @@ void I2sDma::flush_cache_to_dma() {
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "Cache sync failed: %s", esp_err_to_name(err));
   }
+#endif
 }
 
 // ============================================================================
