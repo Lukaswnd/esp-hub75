@@ -37,12 +37,13 @@
 // Header location changed in ESP-IDF 5.0
 #if (ESP_IDF_VERSION_MAJOR >= 5)
 #include <esp_private/periph_ctrl.h>
+#include <esp_memory_utils.h>
+#include <esp_cache.h>
 #else
+#include "rom/cache.h"
 #include <driver/periph_ctrl.h>
 #endif
 #include <esp_heap_caps.h>
-#include <esp_memory_utils.h>
-#include <esp_cache.h>
 
 static const char *const TAG = "GdmaDma";
 
@@ -1308,6 +1309,7 @@ void GdmaDma::flush_cache_to_dma() {
   // Only flush for PSRAM (external RAM) - internal SRAM doesn't need cache sync
   // This handles ESP32-C6 automatically: C6 uses internal RAM, so esp_ptr_external_ram()
   // returns false and we skip the msync (which would be unnecessary overhead).
+#if (ESP_IDF_VERSION_MAJOR >= 5)
   if (!dma_buffers_[active_idx_] || !esp_ptr_external_ram(dma_buffers_[active_idx_])) {
     return;
   }
@@ -1319,6 +1321,9 @@ void GdmaDma::flush_cache_to_dma() {
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "Cache sync failed: %s", esp_err_to_name(err));
   }
+#else
+  Cache_WriteBack_Addr((uint32_t)&p[x_coord], sizeof(ESP32_I2S_DMA_STORAGE_TYPE));
+#endif
 #endif
 }
 
