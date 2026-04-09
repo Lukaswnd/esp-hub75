@@ -80,7 +80,6 @@ extern "C" {
 #endif
 #endif
 
-
 /**
  * Use external framebuffer in PSRAM / SPIRAM
  * Ser via menuconfig or override: -D HUB75_EXTERNAL_FRAMEBUFFERS
@@ -93,17 +92,13 @@ extern "C" {
 #else
 #define HUB75_EXTERNAL_FRAMEBUFFERS 0
 #endif
-#else // HUB75_EXTERNAL_FRAMEBUFFERS
+#else  // HUB75_EXTERNAL_FRAMEBUFFERS
 #if !defined(SOC_SPIRAM_SUPPORTED) && HUB75_EXTERNAL_FRAMEBUFFERS != 0
 #pragma message "SOC does not support external framebuffer, disabling..."
 #undef HUB75_EXTERNAL_FRAMEBUFFERS
 #define HUB75_EXTERNAL_FRAMEBUFFERS 0
 #endif
-#endif  //HUB75_EXTERNAL_FRAMEBUFFERS
-
-
-
-
+#endif  // HUB75_EXTERNAL_FRAMEBUFFERS
 
 #ifdef __cplusplus
 }

@@ -680,7 +680,7 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
       HUB75_PROFILE_PIXEL();
     }
   }
-  if(!config_.double_buffer){
+  if (!config_.double_buffer) {
     flush_cache_to_dma();
   }
 }
@@ -704,7 +704,7 @@ void GdmaDma::clear() {
       }
     }
   }
-  if(!config_.double_buffer){
+  if (!config_.double_buffer) {
     flush_cache_to_dma();
   }
 }
@@ -798,7 +798,7 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
       }
     }
   }
-  if(!config_.double_buffer){
+  if (!config_.double_buffer) {
     flush_cache_to_dma();
   }
 }
@@ -1107,9 +1107,9 @@ void GdmaDma::set_brightness_oe() {
       set_brightness_oe_internal(row_buffer, brightness);
     }
   }
-  
+
   flush_cache_to_dma();
-  
+
   ESP_LOGD(TAG, "Brightness OE configuration complete");
 }
 

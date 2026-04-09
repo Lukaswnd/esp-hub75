@@ -118,8 +118,9 @@ class ParlioDma : public PlatformDma {
   float intensity_;
   bool transfer_started_;
 
-#ifndef SOC_PARLIO_TX_SUPPORT_LOOP_TRANSMISSION  
-  friend bool parlio_trans_done_callback(parlio_tx_unit_handle_t tx_unit, const parlio_tx_done_event_data_t *edata, void *user_ctx);
+#ifndef SOC_PARLIO_TX_SUPPORT_LOOP_TRANSMISSION
+  friend bool parlio_trans_done_callback(parlio_tx_unit_handle_t tx_unit, const parlio_tx_done_event_data_t *edata,
+                                         void *user_ctx);
   parlio_tx_event_callbacks_t parlio_event_cbs;
 #endif
 };
