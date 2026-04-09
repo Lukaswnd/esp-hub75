@@ -1319,8 +1319,8 @@ void I2sDma::flush_cache_to_dma() {
     ESP_LOGW(TAG, "Cache sync failed: %s", esp_err_to_name(err));
   }
 #else
-#ifndef CONFIG_IDF_TARGET_ESP32 // ESP32 has no cache writeback in IDF < v5
-  Cache_WriteBack_Addr((uint32_t)&p[x_coord], sizeof(ESP32_I2S_DMA_STORAGE_TYPE));
+#ifndef CONFIG_IDF_TARGET_ESP32  // ESP32 has no cache writeback in IDF < v5
+  Cache_WriteBack_Addr((uint32_t) &p[x_coord], sizeof(ESP32_I2S_DMA_STORAGE_TYPE));
 #endif
 #endif
 #endif

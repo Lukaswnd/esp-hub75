@@ -1322,7 +1322,7 @@ void GdmaDma::flush_cache_to_dma() {
     ESP_LOGW(TAG, "Cache sync failed: %s", esp_err_to_name(err));
   }
 #else
-  Cache_WriteBack_Addr((uint32_t)&p[x_coord], sizeof(ESP32_I2S_DMA_STORAGE_TYPE));
+  Cache_WriteBack_Addr((uint32_t) &p[x_coord], sizeof(ESP32_I2S_DMA_STORAGE_TYPE));
 #endif
 #endif
 }
