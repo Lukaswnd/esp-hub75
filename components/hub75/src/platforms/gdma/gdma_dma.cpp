@@ -1001,9 +1001,6 @@ void GdmaDma::set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t bri
         }
       }
     }
-    if(!config_.double_buffer){
-      flush_cache_to_dma();
-    }
     return;
   }
 
@@ -1091,9 +1088,6 @@ void GdmaDma::set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t bri
       }
     }
   }
-  if(!config_.double_buffer){
-    flush_cache_to_dma();
-  }
 }
 
 void GdmaDma::set_brightness_oe() {
@@ -1113,7 +1107,9 @@ void GdmaDma::set_brightness_oe() {
       set_brightness_oe_internal(row_buffer, brightness);
     }
   }
-
+  
+  flush_cache_to_dma();
+  
   ESP_LOGD(TAG, "Brightness OE configuration complete");
 }
 
