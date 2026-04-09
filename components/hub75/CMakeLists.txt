@@ -8,10 +8,8 @@ set(HUB75_REQUIRES
     esp_timer
     esp_hw_support
     freertos
+    esp_mm
 )
-if(IDF_TARGET STREQUAL "esp32p4" OR IDF_TARGET STREQUAL "esp32c6")
-    list(APPEND HUB75_REQUIRES esp_mm)
-endif()
 # ESP-IDF 6.0+ split drivers into separate components
 if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
     list(REMOVE_ITEM HUB75_REQUIRES driver) # Remove old "driver" component
