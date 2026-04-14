@@ -100,6 +100,39 @@ extern "C" {
 #endif
 #endif  // HUB75_EXTERNAL_FRAMEBUFFERS
 
+
+
+/**
+ * Enable parallel output support.
+ * Currently up to 3 outputs are supported. This feature is only supported for the lcd implementation for the esp32p4
+ */
+#ifndef HUB75_ENABLE_PARALLEL_OUTPUT
+#ifdef CONFIG_HUB75_ENABLE_PARALLEL_OUTPUT
+#define HUB75_ENABLE_PARALLEL_OUTPUT CONFIG_HUB75_ENABLE_PARALLEL_OUTPUT
+#else
+#define HUB75_ENABLE_PARALLEL_OUTPUT 0
+#endif
+#endif
+
+
+/**
+ * Use lcd implementation for the esp32p4.
+ * This is required for parallel outputs.
+ */
+#ifndef HUB75_USE_DMA_ENGINE_LCD
+#ifdef CONFIG_HUB75_USE_DMA_ENGINE_LCD
+#define HUB75_USE_DMA_ENGINE_LCD CONFIG_HUB75_DMA_USE_ENGINE_LCD
+#else
+#define HUB75_USE_DMA_ENGINE_LCD 0
+#endif
+#endif
+
+#if HUB75_ENABLE_PARALLEL_OUTPUT != 0 && HUB75_USE_DMA_ENGINE_LCD == 0
+#pragma message "Parallel output is enabled but lcd engine is not used, switching..."
+#undef HUB75_USE_DMA_ENGINE_LCD
+#define HUB75_USE_DMA_ENGINE_LCD 1
+#endif
+
 #ifdef __cplusplus
 }
 #endif

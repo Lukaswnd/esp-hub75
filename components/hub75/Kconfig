@@ -737,6 +737,22 @@ menu "HUB75 RGB LED Matrix Driver"
                 avoid overloading the SPIRAM bandwidth, especially since it 
                 may also be shared with other modules such as WiFi.
 
+        config HUB75_USE_DMA_ENGINE_LCD
+            bool "Use lcd driver for panel control"
+            depends on IDF_TARGET_ESP32P4
+            default y if HUB75_ENABLE_PARALLEL_OUTPUT
+            default n
+            help
+                Use ESP32P4's lcd driver to controll the led panel.
+                Is required for parallel outputs on multiple hub75 chains.
+
+        config HUB75_ENABLE_PARALLEL_OUTPUT
+            bool "Enable parallel output"
+            depends on HUB75_USE_DMA_ENGINE_LCD
+            default n
+            help
+                Enable parallel output on multiple hub75 chains.
+
     endmenu
 
     # ========================================

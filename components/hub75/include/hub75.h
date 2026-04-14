@@ -214,6 +214,17 @@ class Hub75Driver {
 
   // Platform-specific DMA engine
   hub75::PlatformDma *dma_;
+
+#if HUB75_ENABLE_PARALLEL_OUTPUT == 1
+  // Cached virtual dimensions (computed once in begin(), accounts for strands)
+  uint16_t virtual_width_;
+  uint16_t virtual_height_;
+
+  static uint16_t compute_virtual_width(const Hub75Config &cfg);
+
+  /// Compute strand-aware virtual height
+  static uint16_t compute_virtual_height(const Hub75Config &cfg);
+#endif
 };
 
 #endif  // __cplusplus

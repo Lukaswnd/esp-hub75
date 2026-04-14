@@ -47,8 +47,27 @@ using PlatformDMAImpl = LcdDma;
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
-
-Hub75Driver::Hub75Driver(const Hub75Config &config) : config_(config), running_(false), dma_(nullptr) {
+#if HUB75_ENABLE_PARALLEL_OUTPUT == 1
+Hub75Driver::Hub75Driver(const Hub75Config &config) : 
+      config_(config), running_(false), dma_(nullptr),
+      virtual_width_(compute_virtual_width(config)),
+      virtual_height_(compute_virtual_height(config)) 
+      {
+  ESP_LOGI(TAG, "Driver created for %s (%s)", getPlatformName(), getDMAEngineName());
+  ESP_LOGI("HUB75", "Panel: %dx%d, Layout: %dx%d, Virtual: %dx%d%s",
+           config_.panel_width, config_.panel_height,
+           config_.layout_cols, config_.layout_rows,
+           virtual_width_, virtual_height_,
+           config_.num_strands > 1
+               ? (config_.strand_arrangement == Hub75StrandArrangement::ROWS
+                  ? " (multi-strand ROWS)" : " (multi-strand COLUMNS)")
+               : "");
+  ESP_LOGI(TAG, "Config: %u-bit depth (compile-time), %u row addresses, four-scan: %s", HUB75_BIT_DEPTH,
+           (unsigned int) get_effective_num_rows(config_.scan_wiring, config_.panel_height),
+           is_four_scan_wiring(config_.scan_wiring) ? "yes" : "no");
+}
+#else
+Hub75Driver::Hub75Driver(const Hub75Config &config) : config_(config), running_(false), dma_(nullptr)      {
   ESP_LOGI(TAG, "Driver created for %s (%s)", getPlatformName(), getDMAEngineName());
   ESP_LOGI(TAG, "Panel: %dx%d, Layout: %dx%d, Virtual: %dx%d", (unsigned int) config_.panel_width,
            (unsigned int) config_.panel_height, (unsigned int) config_.layout_cols, (unsigned int) config_.layout_rows,
@@ -58,6 +77,7 @@ Hub75Driver::Hub75Driver(const Hub75Config &config) : config_(config), running_(
            (unsigned int) get_effective_num_rows(config_.scan_wiring, config_.panel_height),
            is_four_scan_wiring(config_.scan_wiring) ? "yes" : "no");
 }
+#endif
 
 Hub75Driver::~Hub75Driver() { end(); }
 
@@ -212,6 +232,38 @@ void Hub75Driver::set_intensity(float intensity) {
 // Information
 // ============================================================================
 
+#if HUB75_ENABLE_PARALLEL_OUTPUT == 1
+
+uint16_t Hub75Driver::get_width() const {
+  // Return rotation-aware dimensions using cached strand-aware virtual size
+  return hub75::RotationTransform::get_rotated_width(
+      virtual_width_, virtual_height_, config_.rotation);
+}
+
+uint16_t Hub75Driver::get_height() const {
+  // Return virtual height with rotation applied
+  return hub75::RotationTransform::get_rotated_height(
+        virtual_width_, virtual_height_, config_.rotation);
+}
+
+uint16_t Hub75Driver::compute_virtual_width(const Hub75Config &cfg) {
+  const uint16_t strand_w = cfg.panel_width * cfg.layout_cols;
+  const uint8_t ns = (cfg.num_strands >= 1 && cfg.num_strands <= 3) ? cfg.num_strands : 1;
+  if (ns > 1 && cfg.strand_arrangement == Hub75StrandArrangement::COLUMNS)
+    return strand_w * ns;
+  return strand_w;
+}
+
+uint16_t Hub75Driver::compute_virtual_height(const Hub75Config &cfg) {
+  const uint16_t strand_h = cfg.panel_height * cfg.layout_rows;
+  const uint8_t ns = (cfg.num_strands >= 1 && cfg.num_strands <= 3) ? cfg.num_strands : 1;
+  if (ns > 1 && cfg.strand_arrangement == Hub75StrandArrangement::ROWS)
+    return strand_h * ns;
+  return strand_h;
+}
+
+#else
+
 uint16_t Hub75Driver::get_width() const {
   // Return virtual width with rotation applied
   uint16_t phys_w = config_.panel_width * config_.layout_cols;
@@ -225,5 +277,8 @@ uint16_t Hub75Driver::get_height() const {
   uint16_t phys_h = config_.panel_height * config_.layout_rows;
   return RotationTransform::get_rotated_height(phys_w, phys_h, config_.rotation);
 }
+
+#endif
+
 
 bool Hub75Driver::is_running() const { return running_; }

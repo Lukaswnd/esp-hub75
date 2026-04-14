@@ -9,6 +9,8 @@
 // Include ESP-IDF sdkconfig for CONFIG_IDF_TARGET_* macros
 #include <sdkconfig.h>
 
+#include "hub75_config.h"
+
 // Platform detection based on ESP-IDF target
 // Note: Platform-specific includes and type aliases are handled in platform_dma.hpp
 // This file only defines platform identification macros and helper functions
@@ -30,7 +32,7 @@
 
 #elif defined(CONFIG_IDF_TARGET_ESP32P4)
 #define HUB75_PLATFORM_ESP32P4
-#ifdef HUB75_USE_DMA_ENGINE_LCD
+#if HUB75_USE_DMA_ENGINE_LCD == 1
 #define HUB75_DMA_ENGINE_LCD
 #else
 #define HUB75_DMA_ENGINE_PARLIO

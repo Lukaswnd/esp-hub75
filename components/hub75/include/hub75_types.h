@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "hub75_config.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -148,6 +150,29 @@ struct Hub75Pins {
   int8_t clk = -1;  // Clock
 };
 
+#if HUB75_ENABLE_PARALLEL_OUTPUT == 1
+/**
+ * @brief Layout of multiple outputs
+ * 
+ * Configure each output as row or column of the total display.
+ * PanelLayouts can still be added to the the outputs, but it has to be the same.
+ */
+enum class Hub75StrandArrangement : uint8_t {
+    ROWS,      // Outputs above eachother
+    COLUMNS,   // Outputs next to eachother
+};
+
+/**
+ * @brief Pin configuration for HUB75 interface number 2 and 3
+ * 
+ * struct to handle the pins of multiple outputs 
+ */
+struct Hub75StrandPins {
+    int8_t r1 = -1, g1 = -1, b1 = -1;
+    int8_t r2 = -1, g2 = -1, b2 = -1;
+};
+#endif
+
 /**
  * @brief Driver configuration
  */
@@ -222,6 +247,16 @@ struct Hub75Config {
   // ========================================
 
   uint8_t brightness = 128;  // Initial brightness 0-255 (default: 128)
+
+#if HUB75_ENABLE_PARALLEL_OUTPUT == 1
+  // ========================================
+  // Multiple outputs
+  // ========================================
+  uint8_t num_strands = 3;  // 1, 2 oder 3
+  Hub75StrandArrangement strand_arrangement = Hub75StrandArrangement::COLUMNS;
+  Hub75StrandPins strand2_pins{};
+  Hub75StrandPins strand3_pins{};
+#endif
 };
 
 // ============================================================================

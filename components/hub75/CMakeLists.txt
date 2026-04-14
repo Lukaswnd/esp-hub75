@@ -22,8 +22,11 @@ if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
     if(IDF_TARGET STREQUAL "esp32s3")
         list(APPEND HUB75_REQUIRES esp_driver_dma)
     endif()
-    if(IDF_TARGET STREQUAL "esp32p4" OR IDF_TARGET STREQUAL "esp32c6")
+    if(IDF_TARGET STREQUAL "esp32c6")
         list(APPEND HUB75_REQUIRES esp_driver_parlio)
+    endif()
+    if(IDF_TARGET STREQUAL "esp32p4")
+        list(APPEND HUB75_REQUIRES esp_driver_parlio esp_lcd esp_driver_gpio)
     endif()
 endif()
 
@@ -52,10 +55,16 @@ elseif(CONFIG_IDF_TARGET_ESP32S3)
     target_sources(${COMPONENT_LIB} PRIVATE
         "src/platforms/gdma/gdma_dma.cpp"
     )
-elseif(CONFIG_IDF_TARGET_ESP32P4 OR CONFIG_IDF_TARGET_ESP32C6)
+elseif(CONFIG_IDF_TARGET_ESP32C6)
     # PARLIO peripheral (ESP32-P4 has clock gating, ESP32-C6 does not)
     target_sources(${COMPONENT_LIB} PRIVATE
         "src/platforms/parlio/parlio_dma.cpp"
+    )
+elseif(CONFIG_IDF_TARGET_ESP32P4)
+    # PARLIO peripheral (ESP32-P4 has clock gating, ESP32-C6 does not)
+    target_sources(${COMPONENT_LIB} PRIVATE
+        "src/platforms/parlio/parlio_dma.cpp"
+        "src/platforms/parlio/lcd_dma.cpp"
     )
 endif()
 
