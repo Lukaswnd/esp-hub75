@@ -14,12 +14,14 @@
 #include "../platforms/platform_detect.h"
 
 // Include platform-specific DMA implementation
-#ifdef CONFIG_IDF_TARGET_ESP32S3
+#ifdef HUB75_DMA_ENGINE_GDMA
 #include "../platforms/gdma/gdma_dma.h"
-#elif defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32S2)
+#elif defined(HUB75_DMA_ENGINE_I2S)
 #include "../platforms/i2s/i2s_dma.h"
-#elif defined(CONFIG_IDF_TARGET_ESP32P4) || defined(CONFIG_IDF_TARGET_ESP32C6)
+#elif defined(HUB75_DMA_ENGINE_PARLIO)
 #include "../platforms/parlio/parlio_dma.h"
+#elif defined(HUB75_DMA_ENGINE_LCD)
+#include "../platforms/lcd/lcd_dma.h"
 #endif
 
 #include <esp_log.h>
@@ -32,12 +34,14 @@ static const char *const TAG = "HUB75";
 using namespace hub75;
 
 // Select platform implementation
-#ifdef CONFIG_IDF_TARGET_ESP32S3
+#ifdef HUB75_DMA_ENGINE_GDMA
 using PlatformDMAImpl = GdmaDma;
-#elif defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32S2)
+#elif defined(HUB75_DMA_ENGINE_I2S)
 using PlatformDMAImpl = I2sDma;
-#elif defined(CONFIG_IDF_TARGET_ESP32P4) || defined(CONFIG_IDF_TARGET_ESP32C6)
+#elif defined(HUB75_DMA_ENGINE_PARLIO)
 using PlatformDMAImpl = ParlioDma;
+#elif defined(HUB75_DMA_ENGINE_LCD)
+using PlatformDMAImpl = LcdDma;
 #endif
 
 // ============================================================================

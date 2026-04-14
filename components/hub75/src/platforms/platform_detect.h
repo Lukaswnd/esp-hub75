@@ -30,7 +30,11 @@
 
 #elif defined(CONFIG_IDF_TARGET_ESP32P4)
 #define HUB75_PLATFORM_ESP32P4
+#ifdef HUB75_USE_DMA_ENGINE_LCD
+#define HUB75_DMA_ENGINE_LCD
+#else
 #define HUB75_DMA_ENGINE_PARLIO
+#endif
 
 #else
 #error "Unsupported ESP32 variant for HUB75 driver"
@@ -67,6 +71,8 @@ inline constexpr const char *getDMAEngineName() {
   return "LCD_CAM+GDMA";
 #elif defined(HUB75_DMA_ENGINE_PARLIO)
   return "PARLIO";
+#elif defined(HUB75_DMA_ENGINE_LCD)
+  return "LCD";
 #else
   return "Unknown";
 #endif
