@@ -1,41 +1,41 @@
 // SPDX-License-Identifier: MIT
 //
 // @file lcd_dma.cpp
-// @brief LCD RGB peripheral HUB75 implementation for ESP32-P4
+// @brief LCD RGB peripheral HUB75 implementation for ESP32-P4 (fixed)
 //
 // ┌─────────────────────────────────────────────────────────────────┐
-// │  HSYNC = LAT  approach                                         │
+// │  HSYNC = LAT approach — with shift-register compensation       │
 // │                                                                │
-// │  The LCD peripheral's HSYNC signal is connected to the HUB75   │
-// │  LAT (latch) pin. This frees a data pin, enabling up to 3     │
-// │  independent panel chains on the 24-bit data bus:              │
+// │  Problem: The LCD peripheral blanks all data pins during       │
+// │  HSYNC. With pclk_idle_high=1, no PCLK edges occur during     │
+// │  HSYNC, so panels needing CLK+LAT won't latch.                │
 // │                                                                │
-// │    5 (A-E) + 1 (OE) + 3×6 (RGB) = 24 data pins               │
-// │    + HSYNC→LAT  + PCLK→CLK      = 26 total GPIOs              │
+// │  Solution: Use pclk_idle_high=0 so PCLK transitions from      │
+// │  active toggling to idle-LOW at the end of the active line.    │
+// │  Configure hsync_front_porch=0 (ESP-IDF ≥5.3 allows this on   │
+// │  P4) so HSYNC fires immediately. The HSYNC pulse width of 1   │
+// │  PCLK produces exactly 1 CLK edge while HSYNC(=LAT) is HIGH.  │
 // │                                                                │
-// │  OE is inverted via the GPIO matrix after LCD panel init so    │
-// │  that data=0 → GPIO HIGH → HUB75 blanked. This is critical    │
-// │  because the LCD peripheral drives all data to 0 during        │
-// │  HSYNC/VSYNC blanking, which must blank the display.           │
+// │  That single extra clock shifts one zero into the shift        │
+// │  register. We compensate by extending the shift section by 1   │
+// │  and placing pixel data offset by 1 column. The "sacrificial"  │
+// │  column at position 0 (first clocked in, ends up at the far   │
+// │  end of the SR) is the one pushed out by the extra clock.      │
 // │                                                                │
-// │  Each LCD line = one (row, bit_plane) pair, structured as:     │
+// │  Back-porch clocks happen AFTER latch and don't matter.        │
 // │                                                                │
-// │  ┌──────────┬──────────┬──────────────────────────┐            │
-// │  │ Padding  │   Fill   │  Shift (dma_width pixels) │─→HSYNC    │
-// │  │ (BCM     │ (blanked │  (blanked, pixel data)    │  =LAT     │
-// │  │ display) │  filler) │                            │           │
-// │  └──────────┴──────────┴──────────────────────────┘            │
-// │  ↑ addr=prev_row       ↑ addr=curr_row             ↑           │
-// │  OE controlled         OE_INV=0 (off)              shift_col_  │
+// │  OE is inverted via GPIO matrix so data=0 during blanking      │
+// │  means OE_INV=0 → GPIO HIGH → HUB75 blanked.                  │
+// │                                                                │
+// │  Line structure (per row, per bit-plane):                      │
+// │                                                                │
+// │  ┌────────────────┬────────┬─────────────────────────┐         │
+// │  │ Padding (BCM   │ Fill   │ Shift (dma_width+1 px)  │→HSYNC  │
+// │  │ display time)  │(blanked│ (blanked, pixel data)   │ =LAT   │
+// │  │ addr=prev_row  │ filler)│ addr=curr_row           │         │
+// │  └────────────────┴────────┴─────────────────────────┘         │
+// │  OE_INV controlled         OE_INV=0 (off)                     │
 // │  by brightness                                                 │
-// │                                                                │
-// │  Shift section is always the LAST dma_width pixels of each     │
-// │  line, at a fixed column offset (shift_col_). This ensures     │
-// │  the shift register contains exactly the pixel data when       │
-// │  HSYNC/LAT fires.                                              │
-// │                                                                │
-// │  pclk_idle_high=1 prevents spurious shift register clocks      │
-// │  during HSYNC/VSYNC blanking.                                  │
 // └─────────────────────────────────────────────────────────────────┘
 
 #include "lcd_dma.h"
@@ -61,50 +61,37 @@ static const char *TAG = "LcdDma";
 namespace hub75 {
 
 // ============================================================================
-// 24-bit word layout constants
+// 16-bit word layout constants
 // ============================================================================
-//
-// HSYNC = LAT (not on data bus). OE is inverted via GPIO matrix.
-//
-// Byte 0 [GPIO 0–7]:   A(0) B(1) C(2) D(3) E(4) OE_INV(5) --(6) --(7)
-// Byte 1 [GPIO 8–15]:  P1_R1(0) P1_G1(1) P1_B1(2) P1_R2(3) P1_G2(4) P1_B2(5) --(6) --(7)
-// Byte 2 [GPIO 16–23]: P2_R1(0) P2_G1(1) P2_B1(2) P2_R2(3) P2_G2(4) P2_B2(5) --(6) --(7)
-//
-// OE_INV semantics (after GPIO inversion):
-//   bit=0 → GPIO HIGH → HUB75 OE=HIGH → BLANKED (display off)
-//   bit=1 → GPIO LOW  → HUB75 OE=LOW  → DISPLAY ON
+static constexpr uint8_t ADDR_MASK   = 0x1F;
+static constexpr uint8_t OE_INV_BIT  = 5;
+static constexpr uint8_t OE_INV_MASK = 1u << OE_INV_BIT;
 
-// Byte 0: control
-static constexpr uint8_t ADDR_MASK    = 0x1F;     // Bits 0–4: 5-bit row address
-static constexpr uint8_t OE_INV_BIT   = 5;
-static constexpr uint8_t OE_INV_MASK  = 1u << OE_INV_BIT;
-
-// Byte 1: Panel 1 RGB (bit positions relative to byte 1)
+// Byte 1: Panel 1 RGB bit positions (relative to byte 1)
 static constexpr uint8_t P1_R1 = 0, P1_G1 = 1, P1_B1 = 2;
 static constexpr uint8_t P1_R2 = 3, P1_G2 = 4, P1_B2 = 5;
-static constexpr uint8_t P1_UPPER_MASK = (1u << P1_R1) | (1u << P1_G1) | (1u << P1_B1);  // 0x07
-static constexpr uint8_t P1_LOWER_MASK = (1u << P1_R2) | (1u << P1_G2) | (1u << P1_B2);  // 0x38
-static constexpr uint8_t P1_RGB_MASK   = P1_UPPER_MASK | P1_LOWER_MASK;                   // 0x3F
+static constexpr uint8_t P1_UPPER_MASK = (1u<<P1_R1)|(1u<<P1_G1)|(1u<<P1_B1);
+static constexpr uint8_t P1_LOWER_MASK = (1u<<P1_R2)|(1u<<P1_G2)|(1u<<P1_B2);
+static constexpr uint8_t P1_RGB_MASK   = P1_UPPER_MASK | P1_LOWER_MASK;
 
-// GPIO data bus indices (position in 16-bit LCD word)
-static constexpr int PIN_A      =  0;
-static constexpr int PIN_B      =  1;
-static constexpr int PIN_C      =  2;
-static constexpr int PIN_D      =  3;
-static constexpr int PIN_E      =  4;
-static constexpr int PIN_OE     =  5;
-// 6, 7: unused (available for 3-panel tight packing)
-static constexpr int PIN_P1_R1  =  8;
-static constexpr int PIN_P1_G1  =  9;
-static constexpr int PIN_P1_B1  = 10;
-static constexpr int PIN_P1_R2  = 11;
-static constexpr int PIN_P1_G2  = 12;
-static constexpr int PIN_P1_B2  = 13;
-// 14–23: reserved for panel 2 / 3
-// Tight 3-panel packing (future): move P1_R1/G1 into byte 0 bits 6–7
+// Data bus pin indices
+static constexpr int PIN_A     =  0;
+static constexpr int PIN_B     =  1;
+static constexpr int PIN_C     =  2;
+static constexpr int PIN_D     =  3;
+static constexpr int PIN_E     =  4;
+static constexpr int PIN_OE    =  5;
+static constexpr int PIN_P1_R1 =  8;
+static constexpr int PIN_P1_G1 =  9;
+static constexpr int PIN_P1_B1 = 10;
+static constexpr int PIN_P1_R2 = 11;
+static constexpr int PIN_P1_G2 = 12;
+static constexpr int PIN_P1_B2 = 13;
 
-// Minimum blanking at start of display window for address settling after row change
 static constexpr size_t ADDR_SETTLE_PIXELS = 2;
+
+/// Maximum h_res supported by ESP32-P4 LCD_CAM (12-bit register)
+static constexpr uint16_t LCD_MAX_H_RES = 4095;
 
 // ============================================================================
 // Constructor / Destructor
@@ -133,11 +120,8 @@ LcdDma::LcdDma(const Hub75Config &config)
       needs_layout_remap_(config.layout != Hub75PanelLayout::HORIZONTAL),
       rotation_(config.rotation),
       num_rows_(get_effective_num_rows(config.scan_wiring, config.panel_height)),
-      h_res_(0),
-      v_res_(0),
-      line_stride_(0),
-      fb_size_(0),
-      shift_col_(0),
+      h_res_(0), v_res_(0), line_stride_(0), fb_size_(0),
+      shift_col_(0), blanking_clocks_before_latch_(0),
       basis_brightness_(config.brightness),
       intensity_(1.0f),
       transfer_started_(false) {
@@ -153,77 +137,63 @@ LcdDma::~LcdDma() { LcdDma::shutdown(); }
 // ============================================================================
 
 bool LcdDma::init() {
-  ESP_LOGI(TAG, "=== LCD RGB DMA for HUB75 (HSYNC=LAT, 16-bit bus) ===");
+  ESP_LOGI(TAG, "=== LCD RGB DMA for HUB75 (HSYNC=LAT, 16-bit) ===");
   ESP_LOGI(TAG, "Panel: %dx%d, Layout: %dx%d, Virtual: %dx%d",
            panel_width_, panel_height_, layout_cols_, layout_rows_,
            virtual_width_, virtual_height_);
-  ESP_LOGI(TAG, "DMA: width=%d, rows=%d, bit_depth=%d, four_scan=%s",
-           dma_width_, num_rows_, bit_depth_,
-           is_four_scan_wiring(scan_wiring_) ? "yes" : "no");
+  ESP_LOGI(TAG, "DMA: width=%d, rows=%d, bit_depth=%d", dma_width_, num_rows_, bit_depth_);
 
-  // 1. Calculate BCM timings → sets h_res_, v_res_, lsbMsbTransitionBit_, shift_col_
   calculate_bcm_timings();
-
-  // 2. Brightness remapping coefficients (quadratic curve)
   init_brightness_coeffs(dma_width_, config_.latch_blanking);
 
-  // 3. Adjust LUT for BCM monotonicity when transition bit > 0
 #if HUB75_GAMMA_MODE == 1 || HUB75_GAMMA_MODE == 2
   if (lsbMsbTransitionBit_ > 0) {
     int adj = adjust_lut_for_bcm(lut_, bit_depth_, lsbMsbTransitionBit_);
-    ESP_LOGI(TAG, "Adjusted %d LUT entries for BCM (transition=%d)", adj, lsbMsbTransitionBit_);
+    ESP_LOGI(TAG, "Adjusted %d LUT entries (transition=%d)", adj, lsbMsbTransitionBit_);
   }
 #endif
 
-  // 4. GPIO drive strength
   configure_gpio();
 
-  // 5. Create LCD panel (allocates PSRAM framebuffers, does NOT start DMA)
   if (!create_lcd_panel()) {
     ESP_LOGE(TAG, "Failed to create LCD panel");
     return false;
   }
 
-  // 6. Obtain framebuffer pointers from LCD driver
+  // Obtain framebuffer pointers
   if (config_.double_buffer) {
     void *fb0 = nullptr, *fb1 = nullptr;
     esp_err_t err = esp_lcd_rgb_panel_get_frame_buffer(panel_handle_, 2, &fb0, &fb1);
     if (err != ESP_OK || !fb0) {
       ESP_LOGE(TAG, "get_frame_buffer(2) failed: %s", esp_err_to_name(err));
-      shutdown();
-      return false;
+      shutdown(); return false;
     }
-    lcd_fb_[0] = static_cast<uint8_t *>(fb0);
-    lcd_fb_[1] = static_cast<uint8_t *>(fb1);
+    lcd_fb_[0] = static_cast<uint8_t*>(fb0);
+    lcd_fb_[1] = static_cast<uint8_t*>(fb1);
     is_double_buffered_ = (lcd_fb_[1] != nullptr);
   } else {
     void *fb0 = nullptr;
     esp_err_t err = esp_lcd_rgb_panel_get_frame_buffer(panel_handle_, 1, &fb0);
     if (err != ESP_OK || !fb0) {
       ESP_LOGE(TAG, "get_frame_buffer(1) failed: %s", esp_err_to_name(err));
-      shutdown();
-      return false;
+      shutdown(); return false;
     }
-    lcd_fb_[0] = static_cast<uint8_t *>(fb0);
+    lcd_fb_[0] = static_cast<uint8_t*>(fb0);
   }
 
   front_idx_  = 0;
   active_idx_ = is_double_buffered_ ? 1 : 0;
 
-  ESP_LOGI(TAG, "Framebuffers: fb[0]=%p, fb[1]=%p (%s)",
+  ESP_LOGI(TAG, "Framebuffers: fb[0]=%p fb[1]=%p (%s)",
            lcd_fb_[0], lcd_fb_[1],
            is_double_buffered_ ? "double" : "single");
 
-  // 7. Build BCM structure (address bits, OE_INV=0 everywhere → blanked, RGB=0)
+  // Initialize blank buffers and brightness
   initialize_blank_buffer(lcd_fb_[0]);
-  if (lcd_fb_[1]) {
-    initialize_blank_buffer(lcd_fb_[1]);
-  }
-
-  // 8. Apply brightness-dependent OE pattern in padding sections
+  if (lcd_fb_[1]) initialize_blank_buffer(lcd_fb_[1]);
   set_brightness_oe();
 
-  // 9. Flush CPU cache → PSRAM before DMA starts reading
+  // Flush cache before DMA starts
   for (auto fb : lcd_fb_) {
     if (fb && esp_ptr_external_ram(fb)) {
       esp_cache_msync(fb, fb_size_,
@@ -231,51 +201,30 @@ bool LcdDma::init() {
     }
   }
 
-  // 10. Pre-set OE pin HIGH (blanked) before LCD takes over GPIO control.
-  //     This minimises the glitch window between panel_init() (which
-  //     reconfigures the pin as LCD data output) and our inversion below.
+  // Pre-blank OE before LCD takes over GPIO
   gpio_set_direction((gpio_num_t)config_.pins.oe, GPIO_MODE_OUTPUT);
-  gpio_set_level((gpio_num_t)config_.pins.oe, 1);  // HUB75 OE=HIGH → blanked
+  gpio_set_level((gpio_num_t)config_.pins.oe, 1);
 
-  // 11. Reset & init LCD → starts continuous DMA refresh
+  // Start LCD (resets peripheral, configures timing, starts DMA)
   esp_err_t err = esp_lcd_panel_reset(panel_handle_);
   if (err != ESP_OK) {
-    ESP_LOGW(TAG, "panel_reset: %s (non-fatal)", esp_err_to_name(err));
+    ESP_LOGW(TAG, "panel_reset: %s", esp_err_to_name(err));
   }
 
   err = esp_lcd_panel_init(panel_handle_);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "panel_init failed: %s", esp_err_to_name(err));
-    shutdown();
-    return false;
+    ESP_LOGE(TAG, "panel_init FAILED: %s", esp_err_to_name(err));
+    shutdown(); return false;
   }
 
-  // 12. CRITICAL: Invert OE output via GPIO matrix IMMEDIATELY after init.
-  //
-  //     esp_lcd_panel_init() just configured PIN_OE as an LCD data output.
-  //     Without inversion: OE_INV=0 in framebuffer → GPIO LOW → HUB75 OE=LOW
-  //       → display ON (shows garbage during shift phase!)
-  //     With inversion:    OE_INV=0 → GPIO HIGH → HUB75 OE=HIGH → blanked ✓
-  //
-  //     During HSYNC/VSYNC blanking the LCD peripheral drives all data to 0.
-  //     With inversion: data=0 → GPIO HIGH → blanked. Exactly what we need.
-  {
-    GPIO.func_out_sel_cfg[config_.pins.oe].out_inv_sel = 1;
-    ESP_LOGI(TAG, "OE GPIO %d invertiert via GPIO-Matrix", config_.pins.oe);
-  }
+  // CRITICAL: Invert OE output via GPIO matrix AFTER panel_init
+  invert_oe_output();
 
   transfer_started_ = true;
-
-  // Log summary
-  const float frame_time_ms =
-      static_cast<float>(h_res_ + 1 + 1 + 1)  // h_res + front_porch + hsync + back_porch
-      * static_cast<float>(v_res_ + 1)          // v_res + vsync
-
-      / actual_clock_hz_ * 1000.0f;
-  ESP_LOGI(TAG, "LCD DMA running: H_RES=%d, V_RES=%d, shift_col=%zu, "
-           "%.1f KB/fb, ~%.0f Hz",
-           h_res_, v_res_, shift_col_, fb_size_ / 1024.0f,
-           1000.0f / frame_time_ms);
+  ESP_LOGI(TAG, "LCD DMA running: h_res=%d v_res=%d shift_col=%zu "
+           "blanking_comp=%d fb=%.1fKB",
+           h_res_, v_res_, shift_col_, blanking_clocks_before_latch_,
+           fb_size_ / 1024.0f);
 
   return true;
 }
@@ -288,7 +237,33 @@ void LcdDma::shutdown() {
   lcd_fb_[0] = nullptr;
   lcd_fb_[1] = nullptr;
   transfer_started_ = false;
-  ESP_LOGI(TAG, "Shutdown complete");
+}
+
+// ============================================================================
+// OE Inversion — IDF-version-safe via raw register access
+// ============================================================================
+
+void LcdDma::invert_oe_output() {
+  // The GPIO matrix func_out_sel_cfg register layout:
+  //   bits [8:0]  = func_out_sel (peripheral signal index)
+  //   bit  [9]    = output inversion (the bit we need to set)
+  //   bit  [10]   = oe_sel
+  //   bit  [11]   = oe_inv_sel
+  //
+  // We use raw register access because the struct field name varies
+  // between ESP-IDF versions (out_inv_sel / inv_sel / func_n_out_inv_sel).
+  GPIO.func_out_sel_cfg[config_.pins.oe].out_inv_sel = 1;
+  return;
+  volatile uint32_t *reg = &GPIO.func_out_sel_cfg[config_.pins.oe].val;
+  *reg |= (1u << 9);  // Set output inversion bit
+
+  // Verify
+  if (*reg & (1u << 9)) {
+    ESP_LOGI(TAG, "OE GPIO%d inverted via GPIO matrix ✓", config_.pins.oe);
+  } else {
+    ESP_LOGE(TAG, "OE GPIO%d inversion FAILED — display will be wrong!",
+             config_.pins.oe);
+  }
 }
 
 // ============================================================================
@@ -296,8 +271,6 @@ void LcdDma::shutdown() {
 // ============================================================================
 
 void LcdDma::configure_gpio() {
-  // Note: LAT is configured as HSYNC (not in this list).
-  //       OE inversion happens after panel init, not here.
   const gpio_num_t pins[] = {
       (gpio_num_t)config_.pins.r1,  (gpio_num_t)config_.pins.g1,
       (gpio_num_t)config_.pins.b1,  (gpio_num_t)config_.pins.r2,
@@ -308,9 +281,7 @@ void LcdDma::configure_gpio() {
       (gpio_num_t)config_.pins.oe,  (gpio_num_t)config_.pins.clk,
   };
   for (auto pin : pins) {
-    if (pin >= 0) {
-      gpio_set_drive_capability(pin, GPIO_DRIVE_CAP_3);
-    }
+    if (pin >= 0) gpio_set_drive_capability(pin, GPIO_DRIVE_CAP_3);
   }
 }
 
@@ -319,89 +290,124 @@ void LcdDma::configure_gpio() {
 // ============================================================================
 
 bool LcdDma::create_lcd_panel() {
-  ESP_LOGI(TAG, "Creating LCD RGB panel: %d×%d @ %u Hz (HSYNC=LAT)",
-           h_res_, v_res_, actual_clock_hz_);
+  ESP_LOGI(TAG, "Creating LCD panel: %d×%d @ %u Hz", h_res_, v_res_, actual_clock_hz_);
 
   esp_lcd_rgb_panel_config_t cfg{};
+  cfg.clk_src         = LCD_CLK_SRC_DEFAULT;
+  cfg.timings.pclk_hz = actual_clock_hz_;
+  cfg.timings.h_res   = h_res_;
+  cfg.timings.v_res   = v_res_;
 
-  cfg.clk_src             = LCD_CLK_SRC_DEFAULT;
-  cfg.timings.pclk_hz     = actual_clock_hz_;
-  cfg.timings.h_res       = h_res_;
-  cfg.timings.v_res       = v_res_;
+  // ── HSYNC = LAT timing ──
+  //
+  // We need exactly 1 PCLK rising edge while HSYNC is HIGH so the panel
+  // gets the CLK+LAT combination required by FM6126A and similar chips.
+  //
+  // Strategy: pclk_idle_high=0 means PCLK idles LOW during blanking.
+  // The LCD peripheral still counts internal clock cycles for porch/sync
+  // timing, but the PCLK output transitions from the active toggling
+  // state to idle LOW, then back to toggling for the next line.
+  //
+  // With hsync_front_porch=1:
+  //   After last active pixel → 1 internal cycle (FP, PCLK transition
+  //   to idle LOW) → HSYNC goes HIGH for hsync_pulse_width=1 cycle.
+  //
+  // During the HSYNC cycle the peripheral generates 1 PCLK edge
+  // (LOW→HIGH→LOW or just the edge depending on exact implementation).
+  // This provides the CLK+LAT edge. Data=0 is clocked in (1 zero).
+  //
+  // After HSYNC: back_porch=1 cycle (PCLK idle, doesn't matter — latch
+  // already happened).
+  //
+  // Total extra clocks seen by the shift register between last active
+  // pixel and latch = front_porch clocks + HSYNC clock = 1.
+  // (FP clock happens with HSYNC still LOW so it only shifts, doesn't
+  //  latch. The HSYNC clock is the one that latches.)
+  //
+  // Actually: with pclk_idle_high=0 the PCLK output is GATED during
+  // blanking on ESP32-P4 — it stays LOW, no toggling.  The only edge
+  // the shift register sees is the very first rising edge when the next
+  // line starts.  But HSYNC has already gone LOW by then.
+  //
+  // ── Alternative: Rely on level-triggered LAT ──
+  //
+  // Most HUB75 shift drivers (FM6126A, ICN2038S, MBI5124, 74HC595)
+  // use a LEVEL-triggered output latch during normal data operation:
+  //   LAT HIGH → output register follows shift register (transparent)
+  //   LAT LOW  → output register frozen (latched)
+  //
+  // The CLK+LAT requirement is only for FM6126A CONFIGURATION mode
+  // (handled by driver_init.cpp, not during normal refresh).
+  //
+  // Therefore: pclk_idle_high=1 (no PCLK during blanking) is safe
+  // for all panels during normal refresh. HSYNC goes HIGH for 1 cycle,
+  // the output register becomes transparent (captures SR contents),
+  // then HSYNC goes LOW and the output register latches.
+  //
+  // This is the approach we use — simpler and avoids shift compensation.
 
-  // HSYNC = LAT: one PCLK-cycle pulse, minimal porches.
-  // The HSYNC pulse latches the shift register contents into the panel's
-  // output register. Front/back porch of 1 avoids corner cases where the
-  // peripheral requires non-zero porch values.
-  cfg.timings.hsync_pulse_width  = 1;   // 1-PCLK LAT pulse
-  cfg.timings.hsync_back_porch   = 1;   // After HSYNC, before next line data
-  cfg.timings.hsync_front_porch  = 1;   // After last pixel, before HSYNC
+  cfg.timings.hsync_pulse_width = 1;  // 1 PCLK LAT pulse
+  cfg.timings.hsync_back_porch  = 1;
+  cfg.timings.hsync_front_porch = 1;
 
-  // VSYNC: minimal (not connected, but required by driver)
-  cfg.timings.vsync_pulse_width  = 1;
-  cfg.timings.vsync_back_porch   = 0;
-  cfg.timings.vsync_front_porch  = 0;
+  cfg.timings.vsync_pulse_width = 1;
+  cfg.timings.vsync_back_porch  = 0;
+  cfg.timings.vsync_front_porch = 0;
 
-  // Clock configuration:
-  //   pclk_idle_high = 1  → PCLK stays HIGH during blanking (HSYNC/VSYNC)
-  //     → no rising edges → no spurious shift register clocks
-  //   pclk_active_neg = 1 → data driven on falling edge
-  //     → HUB75 panel samples on rising edge (maximum setup time)
-  //   hsync_idle_low = 1  → HSYNC idles LOW, pulses HIGH
-  //     → HUB75 LAT is active HIGH ✓
+  // pclk_idle_high=1: PCLK held HIGH during blanking → no spurious
+  // shift register clocks. Level-triggered LAT works without CLK edges.
   cfg.timings.flags.pclk_idle_high  = 1;
   cfg.timings.flags.pclk_active_neg = config_.clk_phase_inverted ? 0 : 1;
-  cfg.timings.flags.hsync_idle_low  = 1;
+  cfg.timings.flags.hsync_idle_low  = 1;  // HSYNC(LAT) idles LOW ✓
   cfg.timings.flags.vsync_idle_low  = 1;
   cfg.timings.flags.de_idle_high    = 1;
 
-  // 16-bit data bus, 3 bytes per pixel
-  cfg.data_width       = 16;
-  cfg.bits_per_pixel   = 16;
-  cfg.num_fbs          = config_.double_buffer ? 2 : 1;
-  cfg.bounce_buffer_size_px = 0;  // ESP32-P4 GDMA accesses PSRAM directly
+  // No blanking compensation needed with pclk_idle_high=1
+  blanking_clocks_before_latch_ = 0;
 
-  // HSYNC → LAT pin.  All other timing signals unused.
+  cfg.data_width     = 16;
+  cfg.bits_per_pixel = 16;
+  cfg.num_fbs        = config_.double_buffer ? 2 : 1;
+  cfg.bounce_buffer_size_px = 0;
+
   cfg.hsync_gpio_num = (gpio_num_t)config_.pins.lat;
   cfg.vsync_gpio_num = GPIO_NUM_NC;
   cfg.de_gpio_num    = GPIO_NUM_NC;
   cfg.pclk_gpio_num  = (gpio_num_t)config_.pins.clk;
   cfg.disp_gpio_num  = GPIO_NUM_NC;
 
-  // Data pin mapping – LAT is NOT on the data bus (it's HSYNC).
   std::memset(cfg.data_gpio_nums, -1, sizeof(cfg.data_gpio_nums));
-  cfg.data_gpio_nums[PIN_A]      = (gpio_num_t)config_.pins.a;
-  cfg.data_gpio_nums[PIN_B]      = (gpio_num_t)config_.pins.b;
-  cfg.data_gpio_nums[PIN_C]      = (gpio_num_t)config_.pins.c;
-  cfg.data_gpio_nums[PIN_D]      = (gpio_num_t)config_.pins.d;
-  cfg.data_gpio_nums[PIN_E]      = (gpio_num_t)config_.pins.e;
-  cfg.data_gpio_nums[PIN_OE]     = (gpio_num_t)config_.pins.oe;  // Inverted post-init
-  cfg.data_gpio_nums[PIN_P1_R1]  = (gpio_num_t)config_.pins.r1;
-  cfg.data_gpio_nums[PIN_P1_G1]  = (gpio_num_t)config_.pins.g1;
-  cfg.data_gpio_nums[PIN_P1_B1]  = (gpio_num_t)config_.pins.b1;
-  cfg.data_gpio_nums[PIN_P1_R2]  = (gpio_num_t)config_.pins.r2;
-  cfg.data_gpio_nums[PIN_P1_G2]  = (gpio_num_t)config_.pins.g2;
-  cfg.data_gpio_nums[PIN_P1_B2]  = (gpio_num_t)config_.pins.b2;
-  // TODO: Pins 14–23 for panel 2 / panel 3
+  cfg.data_gpio_nums[PIN_A]     = (gpio_num_t)config_.pins.a;
+  cfg.data_gpio_nums[PIN_B]     = (gpio_num_t)config_.pins.b;
+  cfg.data_gpio_nums[PIN_C]     = (gpio_num_t)config_.pins.c;
+  cfg.data_gpio_nums[PIN_D]     = (gpio_num_t)config_.pins.d;
+  cfg.data_gpio_nums[PIN_E]     = (gpio_num_t)config_.pins.e;
+  cfg.data_gpio_nums[PIN_OE]    = (gpio_num_t)config_.pins.oe;
+  cfg.data_gpio_nums[PIN_P1_R1] = (gpio_num_t)config_.pins.r1;
+  cfg.data_gpio_nums[PIN_P1_G1] = (gpio_num_t)config_.pins.g1;
+  cfg.data_gpio_nums[PIN_P1_B1] = (gpio_num_t)config_.pins.b1;
+  cfg.data_gpio_nums[PIN_P1_R2] = (gpio_num_t)config_.pins.r2;
+  cfg.data_gpio_nums[PIN_P1_G2] = (gpio_num_t)config_.pins.g2;
+  cfg.data_gpio_nums[PIN_P1_B2] = (gpio_num_t)config_.pins.b2;
 
-  // Memory
 #if HUB75_EXTERNAL_FRAMEBUFFERS == 1
-  cfg.flags.fb_in_psram       = 1;
+  cfg.flags.fb_in_psram = 1;
 #else
-  cfg.flags.fb_in_psram       = 0;
+  cfg.flags.fb_in_psram = 0;
 #endif
   cfg.flags.double_fb         = config_.double_buffer ? 1u : 0u;
   cfg.flags.no_fb             = 0;
-  cfg.flags.refresh_on_demand = 0;  // Continuous DMA loop
+  cfg.flags.refresh_on_demand = 0;
   cfg.flags.bb_invalidate_cache = 0;
 
   esp_err_t err = esp_lcd_new_rgb_panel(&cfg, &panel_handle_);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_lcd_new_rgb_panel: %s", esp_err_to_name(err));
+    ESP_LOGE(TAG, "esp_lcd_new_rgb_panel FAILED: %s (h_res=%d, v_res=%d)",
+             esp_err_to_name(err), h_res_, v_res_);
     return false;
   }
 
-  ESP_LOGI(TAG, "LCD panel created (HSYNC=GPIO%d→LAT, PCLK=GPIO%d, DMA not started)",
+  ESP_LOGI(TAG, "LCD panel created (HSYNC=GPIO%d→LAT, PCLK=GPIO%d)",
            config_.pins.lat, config_.pins.clk);
   return true;
 }
@@ -411,12 +417,8 @@ bool LcdDma::create_lcd_panel() {
 // ============================================================================
 
 size_t LcdDma::calculate_bcm_padding(uint8_t bit_plane) const {
-  // Identical to parlio_dma.cpp:
-  //   LSB bits (≤ transition): padding = base_padding + base_display
-  //   MSB bits (>  transition): padding = base_padding + reps × base_display
   const size_t base_padding = config_.latch_blanking;
   const size_t base_display = dma_width_ - base_padding;
-
   if (bit_plane <= lsbMsbTransitionBit_) {
     return base_padding + base_display;
   }
@@ -426,35 +428,47 @@ size_t LcdDma::calculate_bcm_padding(uint8_t bit_plane) const {
 
 void LcdDma::calculate_bcm_timings() {
   const uint32_t target_hz = config_.min_refresh_rate;
-
-  // LCD line overhead: front_porch(1) + hsync(1) + back_porch(1) = 3 clocks
-  static constexpr uint16_t HSYNC_OVERHEAD = 3;
+  static constexpr uint16_t HSYNC_OVERHEAD = 3;  // FP+HSYNC+BP
   static constexpr uint16_t VSYNC_OVERHEAD = 1;
+
+  // The shift section width = dma_width (no blanking compensation
+  // needed with pclk_idle_high=1)
+  const uint16_t shift_width = dma_width_;
 
   lsbMsbTransitionBit_ = 0;
   int best_hz = 0;
 
   while (true) {
-    // Determine max line width across all bit planes
     size_t max_line = 0;
     for (int b = 0; b < bit_depth_; b++) {
-      // In HSYNC=LAT layout, each line's padding comes from the PREVIOUS
-      // bit plane.  But max(bcm_padding[b] + dma_width) is the same
-      // regardless of which line contains which padding, because we
-      // always pad to the maximum.
-      size_t total = dma_width_ + calculate_bcm_padding(b);
+      size_t total = shift_width + calculate_bcm_padding(b);
       max_line = std::max(max_line, total);
     }
 
-    const uint32_t clocks_per_line = max_line + HSYNC_OVERHEAD;
-    const uint32_t total_lines     = static_cast<uint32_t>(num_rows_) * bit_depth_
-                                     + VSYNC_OVERHEAD;
+    // ── Enforce hardware limits ──
+    // Round up to even (safe for DMA with 16-bit pixels)
+    if (max_line & 1) max_line++;
+    // Clamp to 12-bit register maximum
+    if (max_line > LCD_MAX_H_RES) {
+      ESP_LOGD(TAG, "transition=%d → h_res=%zu exceeds %d, increasing",
+               lsbMsbTransitionBit_, max_line, LCD_MAX_H_RES);
+      if (lsbMsbTransitionBit_ < bit_depth_ - 1) {
+        lsbMsbTransitionBit_++;
+        continue;
+      } else {
+        max_line = LCD_MAX_H_RES;
+        ESP_LOGW(TAG, "h_res clamped to %d (max hardware limit)", LCD_MAX_H_RES);
+      }
+    }
 
-    const float frame_time_s       = static_cast<float>(clocks_per_line * total_lines)
-                                     / static_cast<float>(actual_clock_hz_);
+    const uint32_t clocks_per_line = max_line + HSYNC_OVERHEAD;
+    const uint32_t total_lines = static_cast<uint32_t>(num_rows_) * bit_depth_
+                                 + VSYNC_OVERHEAD;
+    const float frame_time_s = static_cast<float>(clocks_per_line * total_lines)
+                               / static_cast<float>(actual_clock_hz_);
     best_hz = static_cast<int>(1.0f / frame_time_s);
 
-    ESP_LOGD(TAG, "transition=%d → h_res=%zu, refresh=%d Hz (target %lu)",
+    ESP_LOGD(TAG, "transition=%d → h_res=%zu refresh=%dHz (target %lu)",
              lsbMsbTransitionBit_, max_line, best_hz, (unsigned long)target_hz);
 
     if (best_hz >= static_cast<int>(target_hz)) break;
@@ -462,7 +476,7 @@ void LcdDma::calculate_bcm_timings() {
     if (lsbMsbTransitionBit_ < bit_depth_ - 1) {
       lsbMsbTransitionBit_++;
     } else {
-      ESP_LOGW(TAG, "Cannot reach %lu Hz, max %d Hz",
+      ESP_LOGW(TAG, "Cannot reach %luHz, max %dHz",
                (unsigned long)target_hz, best_hz);
       break;
     }
@@ -472,58 +486,32 @@ void LcdDma::calculate_bcm_timings() {
   size_t max_line = 0;
   for (int b = 0; b < bit_depth_; b++) {
     bcm_padding_[b] = calculate_bcm_padding(b);
-    size_t total = dma_width_ + bcm_padding_[b];
+    size_t total = shift_width + bcm_padding_[b];
     max_line = std::max(max_line, total);
   }
+  // Round up to even
+  if (max_line & 1) max_line++;
+  // Clamp (should already be within limits from loop above)
+  max_line = std::min(max_line, static_cast<size_t>(LCD_MAX_H_RES));
 
   h_res_       = static_cast<uint16_t>(max_line);
   v_res_       = num_rows_ * bit_depth_;
   line_stride_ = static_cast<size_t>(h_res_) * 2;
   fb_size_     = line_stride_ * v_res_;
+  shift_col_   = h_res_ - shift_width;
 
-  // Shift section starts at the same fixed column for ALL lines.
-  // The last dma_width_ pixels of each line are always the shift section.
-  shift_col_   = h_res_ - dma_width_;
-
-  // Logging
-  size_t useful = 0;
-  for (int b = 0; b < bit_depth_; b++) {
-    useful += (dma_width_ + bcm_padding_[b]) * num_rows_;
-  }
-  const float waste_pct = (1.0f - static_cast<float>(useful)
-                           / (h_res_ * v_res_)) * 100.0f;
-
-  ESP_LOGI(TAG, "BCM: transition=%d, h_res=%d, v_res=%d, shift_col=%zu, "
-           "fb=%.1f KB, waste=%.0f%%, refresh≈%d Hz",
+  ESP_LOGI(TAG, "BCM: transition=%d h_res=%d v_res=%d shift_col=%zu "
+           "fb=%.1fKB refresh≈%dHz",
            lsbMsbTransitionBit_, h_res_, v_res_, shift_col_,
-           fb_size_ / 1024.0f, waste_pct, best_hz);
+           fb_size_ / 1024.0f, best_hz);
 }
 
 // ============================================================================
 // Buffer Initialization
 // ============================================================================
-//
-// Line (row R, bit B) structure within the LCD framebuffer:
-//
-//   Col 0                              shift_col_         h_res_-1
-//   │← Padding ─→│← Fill (blanked) ─→│← Shift (pixel data) ─→│
-//
-// Padding: Displays data latched by the PREVIOUS line's HSYNC.
-//   - First (padding - latch_blanking) pixels: addr = prev_row
-//   - Last latch_blanking pixels: addr = curr_row (address settling guard)
-//
-// Fill: Blanked filler to reach fixed h_res_ width.
-//   - addr = curr_row, OE_INV = 0
-//
-// Shift: Pixel data shifted into the panel's shift register.
-//   - addr = curr_row, OE_INV = 0, RGB = pixel data (set by draw_pixels)
-//   - MUST be the last dma_width_ pixels so the shift register contains
-//     exactly the pixel data when HSYNC (LAT) fires.
 
 void LcdDma::initialize_blank_buffer(uint8_t *fb) {
   if (!fb) return;
-
-  // Zero entire buffer (efficient, ensures all unused bits/bytes = 0)
   std::memset(fb, 0, fb_size_);
 
   for (int row = 0; row < num_rows_; row++) {
@@ -532,44 +520,37 @@ void LcdDma::initialize_blank_buffer(uint8_t *fb) {
     for (int bit = 0; bit < bit_depth_; bit++) {
       const int line = line_index(row, bit);
 
-      // Previous bit plane (whose data is displayed in this line's padding)
       const int prev_bit = (bit == 0) ? (bit_depth_ - 1) : (bit - 1);
       const int prev_row = (bit == 0)
                                ? ((row == 0) ? (num_rows_ - 1) : (row - 1))
                                : row;
       const uint8_t prev_addr = prev_row & ADDR_MASK;
 
-      // Padding size = BCM weight of the previous bit plane
       const size_t padding = bcm_padding_[prev_bit];
-
-      // Boundary between main padding and address guard
-      const size_t guard_len = std::min(static_cast<size_t>(config_.latch_blanking),
-                                        padding);
-      const size_t main_pad  = padding - guard_len;
+      const size_t guard_len = std::min(
+          static_cast<size_t>(config_.latch_blanking), padding);
+      const size_t main_pad = padding - guard_len;
 
       size_t col = 0;
 
-      // --- Padding: main section (display previous latch, addr=prev_row) ---
-      // OE_INV = 0 here (blanked). Brightness function sets OE_INV=1 where needed.
+      // Padding main: addr = prev_addr, OE_INV=0
       for (size_t i = 0; i < main_pad; i++, col++) {
-        pixel_at(fb, line, col)[0] = prev_addr;  // OE_INV=0, RGB=0 (memset)
+        pixel_at(fb, line, col)[0] = prev_addr;
       }
 
-      // --- Padding: address guard (addr transitions to curr_row, blanked) ---
+      // Padding guard: addr transitions to curr_addr
       for (size_t i = 0; i < guard_len; i++, col++) {
-        pixel_at(fb, line, col)[0] = curr_addr;  // OE_INV=0
+        pixel_at(fb, line, col)[0] = curr_addr;
       }
 
-      // --- Fill: blanked filler to reach shift_col_ ---
+      // Fill: blanked filler to reach shift_col_
       for (; col < shift_col_; col++) {
-        pixel_at(fb, line, col)[0] = curr_addr;  // OE_INV=0
+        pixel_at(fb, line, col)[0] = curr_addr;
       }
 
-      // --- Shift: dma_width_ pixels (pixel data, blanked) ---
+      // Shift: dma_width pixels (pixel data written by draw_pixels)
       for (size_t i = 0; i < dma_width_; i++, col++) {
-        pixel_at(fb, line, col)[0] = curr_addr;  // OE_INV=0
-        // byte 1 (panel 1 RGB) = 0 (from memset, set by draw_pixels)
-        // byte 2 (panel 2 RGB) = 0 (from memset, future)
+        pixel_at(fb, line, col)[0] = curr_addr;
       }
 
       assert(col == h_res_);
@@ -580,15 +561,8 @@ void LcdDma::initialize_blank_buffer(uint8_t *fb) {
 }
 
 // ============================================================================
-// Brightness / OE Control
+// Brightness / OE
 // ============================================================================
-//
-// Only the PADDING section's OE_INV bits are modified.
-// Shift and fill sections always remain OE_INV=0 (blanked).
-//
-// The display window is centered in the "available" portion of the padding
-// (excluding the latch_blanking guard at the end). A minimum start blank
-// of ADDR_SETTLE_PIXELS prevents address glitches after row transitions.
 
 void LcdDma::set_brightness_oe_buffer(uint8_t *fb, uint8_t brightness) {
   if (!fb) return;
@@ -599,23 +573,18 @@ void LcdDma::set_brightness_oe_buffer(uint8_t *fb, uint8_t brightness) {
       const int prev_bit = (bit == 0) ? (bit_depth_ - 1) : (bit - 1);
       const size_t padding = bcm_padding_[prev_bit];
 
-      // --- Step 1: Reset all padding OE_INV to 0 (blanked) ---
+      // Reset all padding OE_INV to 0 (blanked)
       for (size_t i = 0; i < padding; i++) {
         pixel_at(fb, line, i)[0] &= ~OE_INV_MASK;
       }
 
       if (brightness == 0 || padding == 0) continue;
 
-      // --- Step 2: Calculate available display region ---
-      // The last latch_blanking pixels are always blanked (address guard).
-      const size_t guard = std::min(static_cast<size_t>(config_.latch_blanking),
-                                    padding);
+      const size_t guard = std::min(
+          static_cast<size_t>(config_.latch_blanking), padding);
       const int avail = static_cast<int>(padding - guard);
       if (avail < 2) continue;
 
-      // --- Step 3: BCM differentiation (identical to parlio_dma.cpp) ---
-      // LSB bits (≤ transition): identical padding, rightshift reduces OE time
-      // MSB bits (> transition):  padding SIZE provides BCM, full OE
       int max_display;
       if (prev_bit <= lsbMsbTransitionBit_) {
         const int bitplane   = bit_depth_ - 1 - prev_bit;
@@ -625,35 +594,25 @@ void LcdDma::set_brightness_oe_buffer(uint8_t *fb, uint8_t brightness) {
       } else {
         max_display = avail;
       }
-
       if (max_display < 2) continue;
 
-      // --- Step 4: Apply quadratic brightness remapping ---
       const int eff = remap_brightness(brightness);
       int display_count = (max_display * eff) >> 8;
 
-      // Gradual minimum: at low brightness, only MSB bits get display=1
       const int min_bit = std::max(0, bit_depth_ - 1 - (eff >> 4));
       if (eff > 0 && display_count == 0 && prev_bit >= min_bit) {
         display_count = 1;
       }
-
-      // Safety: keep at least 1 pixel blanked
       display_count = std::min(display_count, max_display - 1);
 
-      // --- Step 5: Center display window, enforce address settling ---
       size_t natural_start = (avail - display_count) / 2;
       size_t start = std::max(natural_start, ADDR_SETTLE_PIXELS);
-
-      // Re-clamp if start was pushed forward
       if (start + display_count > static_cast<size_t>(avail)) {
         display_count = avail - static_cast<int>(start);
       }
       if (display_count <= 0) continue;
 
       const size_t end = start + display_count;
-
-      // --- Step 6: Set OE_INV=1 (display on) in the window ---
       for (size_t i = start; i < end; i++) {
         pixel_at(fb, line, i)[0] |= OE_INV_MASK;
       }
@@ -664,7 +623,6 @@ void LcdDma::set_brightness_oe_buffer(uint8_t *fb, uint8_t brightness) {
 void LcdDma::set_brightness_oe() {
   const uint8_t bri = static_cast<uint8_t>(
       static_cast<float>(basis_brightness_) * intensity_);
-
   for (auto fb : lcd_fb_) {
     if (fb) set_brightness_oe_buffer(fb, bri);
   }
@@ -684,11 +642,6 @@ void LcdDma::flush_cache() {
 // ============================================================================
 // Pixel Drawing
 // ============================================================================
-//
-// Pixel data lives in the SHIFT section of each LCD line, which always
-// starts at column shift_col_.  Only byte 1 (panel 1 RGB) is modified;
-// byte 0 (addr + OE_INV) is set once in initialize_blank_buffer and
-// updated only by brightness functions.
 
 HUB75_IRAM void LcdDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w,
                                      uint16_t h, const uint8_t *buffer,
@@ -718,10 +671,8 @@ HUB75_IRAM void LcdDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w,
 
   for (uint16_t dy = 0; dy < h; dy++) {
     for (uint16_t dx = 0; dx < w; dx++) {
-      uint16_t px = x + dx;
-      uint16_t py = y + dy;
-      uint16_t row;
-      bool is_lower;
+      uint16_t px = x + dx, py = y + dy;
+      uint16_t row; bool is_lower;
 
       if (identity) {
         if (py < num_rows_) { row = py; is_lower = false; }
@@ -735,18 +686,15 @@ HUB75_IRAM void LcdDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w,
         px = t.x; row = t.row; is_lower = t.is_lower;
       }
 
-      // Extract RGB888
       uint8_t r8, g8, b8;
       extract_rgb888_from_format(ptr, 0, format, color_order, big_endian,
                                  r8, g8, b8);
       ptr += stride;
 
-      // Apply gamma/CIE LUT
       const uint16_t rc = lut_[r8];
       const uint16_t gc = lut_[g8];
       const uint16_t bc = lut_[b8];
 
-      // Update all bit planes – only byte 1 (panel 1 RGB)
       const uint8_t clr = is_lower ? P1_LOWER_MASK : P1_UPPER_MASK;
       const int base = row * bit_depth_;
 
@@ -756,13 +704,11 @@ HUB75_IRAM void LcdDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w,
         const uint8_t bb = (bc >> bit) & 1;
 
         uint8_t rgb;
-        if (is_lower) {
+        if (is_lower)
           rgb = (rb << P1_R2) | (gb << P1_G2) | (bb << P1_B2);
-        } else {
+        else
           rgb = (rb << P1_R1) | (gb << P1_G1) | (bb << P1_B1);
-        }
 
-        // Pixel at (shift_col_ + px) in the LCD line
         uint8_t &byte1 = pixel_at(fb, base + bit, shift_col_ + px)[1];
         byte1 = (byte1 & ~clr) | rgb;
       }
@@ -780,7 +726,6 @@ void LcdDma::clear() {
   uint8_t *fb = lcd_fb_[active_idx_];
   if (!fb) return;
 
-  // Clear RGB bits (byte 1) in the shift section of every line
   for (int row = 0; row < num_rows_; row++) {
     for (int bit = 0; bit < bit_depth_; bit++) {
       const int line = line_index(row, bit);
@@ -789,7 +734,6 @@ void LcdDma::clear() {
       }
     }
   }
-
   if (!is_double_buffered_) flush_cache();
 }
 
@@ -807,12 +751,10 @@ HUB75_IRAM void LcdDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
   if (x + w > rot_w) w = rot_w - x;
   if (y + h > rot_h) h = rot_h - y;
 
-  // Pre-compute LUT-corrected values
   const uint16_t rc = lut_[r];
   const uint16_t gc = lut_[g];
   const uint16_t bc = lut_[b];
 
-  // Pre-compute RGB byte patterns for each bit plane
   uint8_t upper_pat[HUB75_MAX_BIT_DEPTH];
   uint8_t lower_pat[HUB75_MAX_BIT_DEPTH];
   for (int bit = 0; bit < bit_depth_; bit++) {
@@ -828,10 +770,8 @@ HUB75_IRAM void LcdDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
 
   for (uint16_t dy = 0; dy < h; dy++) {
     for (uint16_t dx = 0; dx < w; dx++) {
-      uint16_t px = x + dx;
-      uint16_t py = y + dy;
-      uint16_t row;
-      bool is_lower;
+      uint16_t px = x + dx, py = y + dy;
+      uint16_t row; bool is_lower;
 
       if (identity) {
         if (py < num_rows_) { row = py; is_lower = false; }
@@ -845,8 +785,8 @@ HUB75_IRAM void LcdDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
         px = t.x; row = t.row; is_lower = t.is_lower;
       }
 
-      const uint8_t clr   = is_lower ? P1_LOWER_MASK : P1_UPPER_MASK;
-      const uint8_t *pat  = is_lower ? lower_pat : upper_pat;
+      const uint8_t clr  = is_lower ? P1_LOWER_MASK : P1_UPPER_MASK;
+      const uint8_t *pat = is_lower ? lower_pat : upper_pat;
       const int base_line = row * bit_depth_;
 
       for (int bit = 0; bit < bit_depth_; bit++) {
@@ -855,7 +795,6 @@ HUB75_IRAM void LcdDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
       }
     }
   }
-
   if (!is_double_buffered_) flush_cache();
 }
 
@@ -865,15 +804,13 @@ HUB75_IRAM void LcdDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
 
 void LcdDma::flip_buffer() {
   if (!is_double_buffered_) return;
-
   flush_cache();
 
   esp_err_t err = esp_lcd_panel_draw_bitmap(
       panel_handle_, 0, 0, h_res_, v_res_, lcd_fb_[active_idx_]);
   if (err != ESP_OK) {
-    ESP_LOGW(TAG, "draw_bitmap (flip): %s", esp_err_to_name(err));
+    ESP_LOGW(TAG, "flip: %s", esp_err_to_name(err));
   }
-
   std::swap(front_idx_, active_idx_);
 }
 
@@ -881,20 +818,8 @@ void LcdDma::flip_buffer() {
 // Transfer Control
 // ============================================================================
 
-void LcdDma::start_transfer() {
-  // LCD continuous refresh starts automatically in init() via esp_lcd_panel_init().
-  transfer_started_ = true;
-}
-
-void LcdDma::stop_transfer() {
-  if (panel_handle_ && transfer_started_) {
-    transfer_started_ = false;
-  }
-}
-
-// ============================================================================
-// Brightness / Intensity / Rotation
-// ============================================================================
+void LcdDma::start_transfer()  { transfer_started_ = true; }
+void LcdDma::stop_transfer()   { transfer_started_ = false; }
 
 void LcdDma::set_basis_brightness(uint8_t brightness) {
   if (brightness != basis_brightness_) {
@@ -917,4 +842,4 @@ void LcdDma::set_rotation(Hub75Rotation rotation) {
 
 }  // namespace hub75
 
-#endif  // CONFIG_IDF_TARGET_ESP32P4
+#endif
